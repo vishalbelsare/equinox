@@ -11,7 +11,7 @@ import types
 import warnings
 import weakref
 from collections.abc import Callable
-from typing import Any, cast, Optional, TYPE_CHECKING, TypeVar, Union
+from typing import Any, cast, Optional, Protocol, TYPE_CHECKING, TypeVar, Union
 from typing_extensions import dataclass_transform, ParamSpec
 
 import jax.tree_util as jtu
@@ -141,6 +141,27 @@ class _ModuleMeta(ABCMeta):  # pyright: ignore
     ):
         # [Step 1] Create the class as normal.
         cls = super().__new__(mcs, name, bases, dict_, **kwargs)
+        for base in bases:
+            if _is_special_form(base):
+                continue
+            if not issubclass(base, Module):
+                warnings.warn(
+                    f"Defining `{cls.__module__}.{cls.__qualname__}` as a subclass of "
+                    "`equinox.Module`, but with non-Module superclass "
+                    f"`{base.__module__}.{base.__qualname__}`. This may lead to "
+                    "unexpected behaviour. You should probably have "
+                    f"`{base.__module__}.{base.__qualname__}` inherit from "
+                    "`equinox.Module`, i.e.\n"
+                    "```\n"
+                    f"class {base.__name__}(eqx.Module):\n"
+                    "    ...\n"
+                    "```\n"
+                    f"If `{base.__module__}.{base.__qualname__}` is coming from some "
+                    "other library or framework, then you should consider using "
+                    "composition instead of inheritance.\n"
+                    "If you think this warning is incorrect, then please open a GitHub "
+                    "issue at `https://github.com/patrick-kidger/equinox/issues`."
+                )
         # [Step 2] Arrange for bound methods to be treated as PyTrees as well. This
         # ensures that
         # ```
@@ -155,12 +176,19 @@ class _ModuleMeta(ABCMeta):  # pyright: ignore
                 setattr(cls, k, _wrap_method(v))
         # [Step 3] Create a default `__init__` method if a user method isn't provided.
         #
-        # If as a superclass has a custom `__init__`, then don't create a default
+        # If a superclass has a custom `__init__`, then don't create a default
         # `__init__` here. (Otherwise e.g. if `B` has a custom init then
         # `class A(B): pass` would set a dataclass init on `A`.)
         # If a superclass has a default `__init__`, then do create a new default one
         # here. (Dataclass default `__init__`s don't call `super()`, so they must be
         # overriden directly.)
+        #
+        # In addition we have some fairly horrendous logic that adds in the running of
+        # converters, and checks that every field is initialised. (Originally this was
+        # put in `_ModuleMeta.__calL__` instead, but this meant that (a)
+        # `__post_init__` methods didn't see the results of conversion, and (b) that it
+        # was harder for libraries like jaxtyping to patch their own checks into
+        # `__init__`.)
         added_custom_init = "__init__" in cls.__dict__
         if added_custom_init:
             _dataclass_init = False
@@ -169,19 +197,103 @@ class _ModuleMeta(ABCMeta):  # pyright: ignore
                 try:
                     _dataclass_init = _has_dataclass_init[kls]
                 except KeyError:
+                    # Non-Module superclasses.
                     pass
                 else:
                     break
             else:
                 assert name == "Module"
                 _dataclass_init = True  # eqx.Module itself
-        if _dataclass_init:  # Using a dataclass-generated `__init__`.
+        if _dataclass_init:  # Using a dataclass-generated `__init__`...
             init_doc = cls.__init__.__doc__
-        if not _dataclass_init:  # Using a user-provided `__init__`.
+            try:
+                post_init = cls.__dict__["__post_init__"]
+            except KeyError:
+                # ...and we have not defined a `__post_init__` method...
+                for kls in cls.__mro__:
+                    try:
+                        post_init = kls.__dict__["__post_init__"]
+                    except KeyError:
+                        pass
+                    else:
+                        # ...and a superclass has defined a `__post_init__` method...
+                        if issubclass(kls, Module):
+                            # ...and that superclass is a Module. In this case it will
+                            # already have had conversion and checking done, so we
+                            # don't need to do anything here.
+                            pass
+                        else:
+                            # ...and that superclass is not a Module. In this case it
+                            # will not have had conversion and checking done, so do it
+                            # here.
+                            @ft.wraps(post_init)
+                            def __post_init__(self, *args, **kwargs):  # pyright: ignore
+                                _convert_fields(self, init=True)
+                                post_init(self, *args, **kwargs)
+                                _check_fields(self)
+                                _convert_fields(self, init=False)
+
+                            cls.__post_init__ = __post_init__  # pyright: ignore
+                        break
+                else:
+                    # ...and no superclass has a `__post_init__` method either. In this
+                    # case add in conversion and checking now.
+                    cls.__post_init__ = _default_post_init  # pyright: ignore
+            else:
+                # ...and we have defined a `__post_init__` method, so add in the
+                # conversion and checking now.
+                @ft.wraps(post_init)
+                def __post_init__(self, *args, **kwargs):  # pyright: ignore
+                    _convert_fields(self, init=True)
+                    post_init(self, *args, **kwargs)
+                    _check_fields(self)
+                    _convert_fields(self, init=False)
+
+                cls.__post_init__ = __post_init__  # pyright: ignore
+        else:  # Using a user-provided `__init__`...
+            if added_custom_init:
+                # ...and this user-provided `__init__` was provided in this class, so
+                # add in the conversion and checking now.
+                existing_init = cls.__init__
+
+                @ft.wraps(existing_init)
+                def __init__(self, *args, **kwargs):
+                    existing_init(self, *args, **kwargs)
+                    _check_fields(self)
+                    _convert_fields(self, init=True)
+
+                cls.__init__ = __init__
+            else:
+                # ...and this user-provided `__init__` was provided on a superclass...
+                for kls in cls.__mro__:
+                    try:
+                        parent_init = kls.__dict__["__init__"]
+                    except KeyError:
+                        pass
+                    else:
+                        if issubclass(kls, Module):
+                            # ...and this superclass is itself a Module. In this case
+                            # don't do anything, it will already have had the conversion
+                            # and checking added.
+                            pass
+                        else:
+                            # ...and this superclass is not a Module. Add in the
+                            # conversion and checking.
+                            @ft.wraps(parent_init)
+                            def __init__(self, *args, **kwargs):
+                                parent_init(self, *args, **kwargs)
+                                _check_fields(self)
+                                _convert_fields(self, init=True)
+
+                            cls.__init__ = __init__
+                        break
+                else:
+                    assert False, "Custom init declared but could not be found."
             # Check `_Initable` to avoid printing out duplicate warnings.
-            if getattr(cls, "__post_init__", None) is not None and not issubclass(
-                cls, _Initable
-            ):
+            if (
+                getattr(cls, "__post_init__", _default_post_init)
+                is not _default_post_init
+            ) and not issubclass(cls, _Initable):
                 warnings.warn(
                     f"Class `{cls.__module__}.{cls.__qualname__}` has both an "
                     "`__init__` method and a `__post_init__` method. This means that "
@@ -240,6 +352,9 @@ class _ModuleMeta(ABCMeta):  # pyright: ignore
                     # be able to inherit from it we would need to make it abstract. To
                     # be able to make it abstract its name must start with `Abstract`.
                     # That we cannot do for backward compatibility.
+                    continue
+                if _is_special_form(base):
+                    # Skip `typing.Generic` etc.
                     continue
                 # Invariant: all base classes are also strict modules.
                 if not issubclass(base, Module):
@@ -346,30 +461,10 @@ class _ModuleMeta(ABCMeta):  # pyright: ignore
         # before init.
         initable_cls = _make_initable(cls, wraps=False)
         # [Step 2] Instantiate the class as normal. (`__init__` and `__post_init__`)
+        # and then re-freeze.
         self = super(_ModuleMeta, initable_cls).__call__(*args, **kwargs)
-        # [Step 3] Check that all fields are occupied.
-        missing_names = {
-            field.name
-            for field in dataclasses.fields(cls)  # pyright: ignore
-            # Not `vars` or `__dict__`, to allow for `property`s overwriting a field.
-            # Not recommended, but allowable for backward compatibility.
-            if field.name not in dir(self)
-        }
-        if len(missing_names):
-            raise ValueError(
-                f"The following fields were not initialised during __init__: "
-                f"{missing_names}"
-            )
-        # [Step 4] Run any custom converters.
-        for field in dataclasses.fields(self):
-            try:
-                converter = field.metadata["converter"]
-            except KeyError:
-                pass
-            else:
-                setattr(self, field.name, converter(getattr(self, field.name)))
         object.__setattr__(self, "__class__", cls)
-        # [Step 5] Run any custom validators.
+        # [Step 3] Run any custom validators.
         for kls in cls.__mro__:
             try:
                 check = kls.__dict__["__check_init__"]
@@ -403,6 +498,20 @@ if TYPE_CHECKING:
         pass
 
 
+def _is_special_form(cls):
+    # This function is basically a heuristic hack.
+    # If you're getting spurious warnings from this, and think you have another kind of
+    # class that should be excluded from Equinox's checks, then please open a GitHub
+    # issue: https://github.com/patrick-kidger/equinox/issues
+    if cls is _Initable:
+        return True
+    if cls.__module__ in ("typing", "typing_extensions", "collections.abc"):
+        return True
+    if Protocol in cls.__bases__:
+        return True
+    return False
+
+
 def _not_magic(k: str) -> bool:
     return not (k.startswith("__") and k.endswith("__"))
 
@@ -431,6 +540,53 @@ _dummy_abstract = abc.abstractmethod(lambda self: 1)
 _is_force_abstract = weakref.WeakKeyDictionary()
 _is_strict = weakref.WeakKeyDictionary()
 _has_dataclass_init = weakref.WeakKeyDictionary()
+
+
+def _default_post_init(self, *args, **kwargs):
+    _check_fields(self)
+    _convert_fields(self, init=True)
+
+
+def _check_fields(module):
+    missing_names = {
+        field.name
+        for field in dataclasses.fields(module)
+        # Not `vars` or `__dict__`, to allow for `property`s overwriting a field.
+        # Not recommended, but allowable for backward compatibility.
+        if field.name not in dir(module)
+    }
+    if len(missing_names):
+        raise ValueError(
+            f"The following fields were not initialised during __init__: "
+            f"{missing_names}. If you would like to only optionally set a field, "
+            "e.g.\n"
+            "```\n"
+            "class Foo(eqx.Module)\n"
+            "    x: int\n"
+            "\n"
+            "    def __init__(self, flag: bool):\n"
+            "        if flag:\n"
+            "            self.x = 4\n"
+            "```\n"
+            "then you should fill in the field with a sentinel value, such as "
+            "`None`, when it is not used."
+        )
+
+
+def _convert_fields(module, init: bool):
+    for field in dataclasses.fields(module):
+        if field.init is init:
+            try:
+                converter = field.metadata["converter"]
+            except KeyError:
+                pass
+            else:
+                try:
+                    value = getattr(module, field.name)
+                except AttributeError:
+                    # We let `_check_fields` raise any errors due to missing fields.
+                    continue
+                setattr(module, field.name, converter(value))
 
 
 def _is_abstract(cls):
